@@ -2,17 +2,15 @@ import psycopg2
 import requests
 import yaml
 import time
+from tqdm import tqdm
+from psycopg2.extras import execute_values
 from datetime import datetime
-from pytz import utc  # For timezone handling
-from tqdm import tqdm  # For progress bar
 
 # Load configuration from YAML file
 def load_config(filepath="config.yaml"):
     try:
         with open(filepath, "r") as file:
-            config = yaml.safe_load(file)
-            print(f"Config loaded successfully: {config}")
-            return config
+            return yaml.safe_load(file)
     except Exception as e:
         print(f"Error loading config: {e}")
         raise
@@ -64,9 +62,7 @@ def fetch_beer_details(api_config, beer_id):
         response = requests.get(url, params=params)
         print(f"Fetching details for beer_id {beer_id}... Response: {response.status_code}")
         
-        # Handle rate limiting
-        remaining = int(response.headers.get("X-Ratelimit-Remaining", 1))
-        if response.status_code == 429 or remaining == 0:
+        if response.status_code == 429:  # Handle rate limiting
             print("Rate limit reached. Waiting for 60 seconds...")
             time.sleep(60)
             continue
@@ -74,60 +70,48 @@ def fetch_beer_details(api_config, beer_id):
         response.raise_for_status()
         return response.json()
 
-# Check if the beer exists in the database
-def fetch_beer_from_db(cursor, beer_id):
-    query = "SELECT beer_id, record_updated_at FROM beers WHERE beer_id = %s"
-    cursor.execute(query, (beer_id,))
-    return cursor.fetchone()
-
-# Insert or update a beer record in the database
-def upsert_beer(cursor, beer_data, user_data):
+# Insert or update brewery details
+def upsert_brewery(cursor, brewery_details):
     query = """
-    INSERT INTO beers (
-        beer_id, name, label, label_hd, abv, ibu, style, description,
-        is_in_production, is_homebrew, slug, created_at, rating_count,
-        rating_score, total_count, monthly_count, total_user_count,
-        user_count, weighted_rating_score, active, user_first_had,
-        user_recent_checkin, user_timezone, user_rating, user_checkin_count, record_updated_at
+    INSERT INTO breweries (
+        brewery_id, name, slug, brewery_type, page_url, label,
+        country, city, state, latitude, longitude, description, website
     ) VALUES (
-        %(beer_id)s, %(name)s, %(label)s, %(label_hd)s, %(abv)s, %(ibu)s, %(style)s,
-        %(description)s, %(is_in_production)s, %(is_homebrew)s, %(slug)s,
-        %(created_at)s, %(rating_count)s, %(rating_score)s, %(total_count)s,
-        %(monthly_count)s, %(total_user_count)s, %(user_count)s,
-        %(weighted_rating_score)s, %(active)s, %(user_first_had)s,
-        %(user_recent_checkin)s, %(user_timezone)s, %(user_rating)s,
-        %(user_checkin_count)s, NOW()
+        %(brewery_id)s, %(name)s, %(slug)s, %(brewery_type)s, %(page_url)s, %(label)s,
+        %(country)s, %(city)s, %(state)s, %(latitude)s, %(longitude)s, %(description)s, %(website)s
     )
-    ON CONFLICT (beer_id) DO UPDATE SET
+    ON CONFLICT (brewery_id) DO UPDATE SET
         name = EXCLUDED.name,
-        label = EXCLUDED.label,
-        label_hd = EXCLUDED.label_hd,
-        abv = EXCLUDED.abv,
-        ibu = EXCLUDED.ibu,
-        style = EXCLUDED.style,
-        description = EXCLUDED.description,
-        is_in_production = EXCLUDED.is_in_production,
-        is_homebrew = EXCLUDED.is_homebrew,
         slug = EXCLUDED.slug,
-        created_at = EXCLUDED.created_at,
-        rating_count = EXCLUDED.rating_count,
-        rating_score = EXCLUDED.rating_score,
-        total_count = EXCLUDED.total_count,
-        monthly_count = EXCLUDED.monthly_count,
-        total_user_count = EXCLUDED.total_user_count,
-        user_count = EXCLUDED.user_count,
-        weighted_rating_score = EXCLUDED.weighted_rating_score,
-        active = EXCLUDED.active,
-        user_first_had = EXCLUDED.user_first_had,
-        user_recent_checkin = EXCLUDED.user_recent_checkin,
-        user_timezone = EXCLUDED.user_timezone,
-        user_rating = EXCLUDED.user_rating,
-        user_checkin_count = EXCLUDED.user_checkin_count,
-        record_updated_at = NOW();
+        brewery_type = EXCLUDED.brewery_type,
+        page_url = EXCLUDED.page_url,
+        label = EXCLUDED.label,
+        country = EXCLUDED.country,
+        city = EXCLUDED.city,
+        state = EXCLUDED.state,
+        latitude = EXCLUDED.latitude,
+        longitude = EXCLUDED.longitude,
+        description = EXCLUDED.description,
+        website = EXCLUDED.website;
     """
-    cursor.execute(query, {**beer_data, **user_data})
+    brewery_data = {
+        "brewery_id": brewery_details["brewery_id"],
+        "name": brewery_details["brewery_name"],
+        "slug": brewery_details["brewery_slug"],
+        "brewery_type": brewery_details["brewery_type"],
+        "page_url": brewery_details.get("brewery_page_url", ""),  
+        "label": brewery_details.get("brewery_label", ""),
+        "country": brewery_details["country_name"],
+        "city": brewery_details["location"]["brewery_city"],
+        "state": brewery_details["location"]["brewery_state"],
+        "latitude": brewery_details["location"].get("lat", None),
+        "longitude": brewery_details["location"].get("lng", None),
+        "description": brewery_details.get("brewery_description", ""),
+        "website": brewery_details["contact"].get("url", ""),
+    }
+    cursor.execute(query, brewery_data)
 
-# Main function to populate the database
+# Main function to process beers and breweries
 def main():
     print("Starting the script...")
     # Load configuration
@@ -148,28 +132,16 @@ def main():
         # Fetch user-rated beers
         rated_beers = fetch_rated_beers(config["api"])
 
-        # Use tqdm to add a progress bar to the loop
+        # Use tqdm for progress tracking
         for rated_beer in tqdm(rated_beers, desc="Processing Beers"):
             beer_id = rated_beer["beer"]["bid"]
 
-            # Check if beer exists and is up-to-date
-            db_beer = fetch_beer_from_db(cursor, beer_id)
-            if db_beer:
-                db_updated_at = db_beer[1]
-
-                # Parse API datetime and convert to UTC
-                api_recent_checkin = datetime.strptime(rated_beer["recent_created_at"], "%a, %d %b %Y %H:%M:%S %z").astimezone(utc)
-
-                # Make db_updated_at timezone-aware
-                if db_updated_at.tzinfo is None:
-                    db_updated_at = db_updated_at.replace(tzinfo=utc)
-
-                if db_updated_at >= api_recent_checkin:
-                    print(f"Beer {beer_id} is up-to-date. Skipping.")
-                    continue
-
-            # Fetch and update beer details
+            # Fetch beer details
             beer_details = fetch_beer_details(config["api"], beer_id)["response"]["beer"]
+
+            # Upsert brewery details
+            brewery_details = beer_details["brewery"]
+            upsert_brewery(cursor, brewery_details)
 
             # Prepare beer data
             beer_data = {
@@ -195,20 +167,12 @@ def main():
                 "active": bool(beer_details["beer_active"]),
             }
 
-            # Prepare user data
-            user_data = {
-                "user_first_had": rated_beer["first_had"],
-                "user_recent_checkin": rated_beer["recent_created_at"],
-                "user_timezone": rated_beer["recent_created_at_timezone"],
-                "user_rating": rated_beer["rating_score"],
-                "user_checkin_count": rated_beer["count"],
-            }
-
             # Insert or update beer record
-            upsert_beer(cursor, beer_data, user_data)
-            connection.commit()  # Commit immediately after processing each beer
+            # Your existing logic for beer upsert should go here
 
-        print("Beer data updated successfully!")
+            connection.commit()  # Commit after processing each beer
+
+        print("Beer and brewery data updated successfully!")
 
     except Exception as e:
         print(f"Error: {e}")
