@@ -1,0 +1,12 @@
+database:
+  dbname: "your_database_name"
+  user: "your_username"
+  password: "your_password"
+  host: "your_host"
+  port: "your_port"
+
+api:
+  base_url: "https://api.untappd.com/v4"
+  client_id: "your_client_id"
+  client_secret: "your_client_secret"
+  username: "your_username"
